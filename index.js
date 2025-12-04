@@ -1,103 +1,132 @@
-import express from "express";
-import axios from "axios";
-import cors from "cors";
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.json({ status: "proxy-ok", timestamp: Date.now() });
-});
+// 캐시 (2초 TTL)
+const CACHE_TTL = 2000;
+const cache = new Map();
 
-// 🔥 공통 요청 프록시 함수
-async function proxy(url, res) {
-  try {
-    const response = await axios.get(url, {
-      timeout: 5000,
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-      }
-    });
-    res.json(response.data);
-  } catch (error) {
-    console.error("Proxy Error:", error.message);
-    res.status(500).json({ error: error.message });
+function getCached(key) {
+  const item = cache.get(key);
+  if (item && Date.now() - item.ts < CACHE_TTL) {
+    return item.data;
   }
+  return null;
 }
 
-/* ============================
-   국내 거래소 API 프록시
-============================ */
+function setCache(key, data) {
+  cache.set(key, { data, ts: Date.now() });
+}
 
-// 업비트
-app.get("/upbit/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.upbit.com/${path}`, res);
+// 1) 헬스체크
+app.get('/', (req, res) => {
+  res.json({ status: 'proxy-ok', timestamp: new Date().toISOString() });
 });
 
-// 빗썸
-app.get("/bithumb/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.bithumb.com/${path}`, res);
+// 2) Binance 프록시 - 전체 리스트 호출 후 symbol 필터링
+app.get('/binance/api/v3/ticker/price', async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    const cacheKey = 'binance_spot_all';
+
+    let data = getCached(cacheKey);
+
+    if (!data) {
+      const response = await axios.get('https://api.binance.com/api/v3/ticker/price', {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      data = response.data;
+      setCache(cacheKey, data);
+    }
+
+    if (symbol) {
+      const filtered = data.find(x => x.symbol === symbol);
+      return res.json(filtered || { symbol, price: '0' });
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error('Binance proxy error:', error?.response?.data || error.message);
+    res.status(500).json({ error: 'Binance proxy failed' });
+  }
 });
 
-// 코인원
-app.get("/coinone/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.coinone.co.kr/${path}`, res);
+// Binance Futures 프록시
+app.get('/binance/fapi/v1/ticker/price', async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    const cacheKey = 'binance_futures_all';
+
+    let data = getCached(cacheKey);
+
+    if (!data) {
+      const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/price', {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      data = response.data;
+      setCache(cacheKey, data);
+    }
+
+    if (symbol) {
+      const filtered = data.find(x => x.symbol === symbol);
+      return res.json(filtered || { symbol, price: '0' });
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error('Binance Futures proxy error:', error?.response?.data || error.message);
+    res.status(500).json({ error: 'Binance Futures proxy failed' });
+  }
 });
 
-/* ============================
-   해외 거래소 API 프록시
-============================ */
+// 3) Bybit 프록시 - category만 외부 API에 전달, symbol은 프록시에서 필터링
+app.get('/bybit/v5/market/tickers', async (req, res) => {
+  try {
+    const { category = 'spot', symbol } = req.query;
+    const cacheKey = `bybit_${category}_all`;
 
-// Binance (강제 바이패스용)
-app.get("/binance/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.binance.com/${path}`, res);
-});
+    let data = getCached(cacheKey);
 
-// Binance Futures
-app.get("/binancef/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://fapi.binance.com/${path}`, res);
-});
+    if (!data) {
+      // 외부 API에는 symbol 없이 category만 전달
+      const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
+        params: { category },
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      data = response.data;
+      setCache(cacheKey, data);
+    }
 
-// Bybit
-app.get("/bybit/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.bybit.com/${path}`, res);
-});
+    if (symbol && data.result?.list) {
+      const filtered = data.result.list.filter(x => x.symbol === symbol);
+      return res.json({
+        ...data,
+        result: {
+          ...data.result,
+          list: filtered
+        }
+      });
+    }
 
-// OKX
-app.get("/okx/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://www.okx.com/${path}`, res);
-});
-
-// Bitget
-app.get("/bitget/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.bitget.com/${path}`, res);
-});
-
-// Gate
-app.get("/gate/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.gateio.ws/${path}`, res);
-});
-
-// HTX (Huobi)
-app.get("/htx/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.huobi.pro/${path}`, res);
-});
-
-// MEXC
-app.get("/mexc/*", (req, res) => {
-  const path = req.params[0];
-  proxy(`https://api.mexc.com/${path}`, res);
+    return res.json(data);
+  } catch (error) {
+    console.error('Bybit proxy error:', error?.response?.data || error.message);
+    res.status(500).json({ error: 'Bybit proxy failed' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`KimpAI Proxy Server running on port ${PORT}`);
+});
