@@ -234,6 +234,56 @@ app.get('/binance/api/v3/ticker/24hr', async (req, res) => {
   }
 });
 
+app.get('/binance/fapi/v1/ticker/24hr', async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    const cacheKey = 'binance_futures_24hr';
+    const endpoint = '/binance/fapi/v1/ticker/24hr';
+    
+    console.log(`[Binance Futures 24hr] Request: symbol=${symbol || 'ALL'}`);
+
+    let cached = getCached(cacheKey, STATS_CACHE_TTL, true);
+    let data = cached?.data;
+
+    if (!data) {
+      try {
+        const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', {
+          timeout: 15000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+        data = response.data;
+        setCache(cacheKey, data);
+        console.log(`[Binance Futures 24hr] Fresh data cached: ${data.length} tickers for ${STATS_CACHE_TTL/1000}s`);
+      } catch (err) {
+        if (err.response?.status === 429) {
+          recordRateLimit(endpoint);
+          cached = getCached(cacheKey, STALE_CACHE_TTL, true);
+          if (cached?.data) {
+            console.log('[Binance Futures 24hr] Using stale cache due to rate limit');
+            data = cached.data;
+            res.set('X-Cache-Status', 'stale');
+          } else {
+            return res.status(503).json({ error: 'Rate limited', code: 'BINANCE_FUTURES_RATE_LIMITED', retryAfter: 5 });
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    if (symbol) {
+      const filtered = data.find(x => x.symbol === symbol);
+      return res.json(filtered || null);
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error('Binance Futures 24hr proxy error:', error?.response?.data || error.message);
+    res.status(500).json({ error: 'Binance Futures 24hr proxy failed' });
+  }
+});
+
 app.get('/bybit/v5/market/tickers', async (req, res) => {
   try {
     const { category = 'spot', symbol } = req.query;
