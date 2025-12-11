@@ -1,197 +1,85 @@
-/** 
- * KimpAI Proxy + WebSocket Relay Unified Server
- * Full REST Proxy + WebSocket Bypass (Binance / Bybit / Gate / MEXC)
- */
+// index.js
+// ------------------------------
+// KimpAI Price Proxy Server
+// Render 전용 서비스
+// 1) 가격 프록시(API 우회)
+// 2) Binance TOP100 심볼 제공 API
+// ------------------------------
 
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
-const http = require("http");
-const WebSocket = require("ws");
+const axios = require("axios");
+
+// TOP100 심볼 생성 모듈
+const { fetchTop100Symbols } = require("./topSymbols");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
-const server = http.createServer(app);
-
-/* ============================
-   CACHE + RATE LIMIT HANDLING
-============================ */
-
-const PRICE_CACHE_TTL = 2000;
-const STATS_CACHE_TTL = 5000;
-const STALE_CACHE_TTL = 60000;
-const cache = new Map();
-const rateLimitTracker = new Map();
-
-function getCached(key, ttl = PRICE_CACHE_TTL, allowStale = false) {
-  const item = cache.get(key);
-  if (!item) return null;
-
-  const age = Date.now() - item.ts;
-  if (age < ttl) return { data: item.data, isStale: false };
-  if (allowStale && age < STALE_CACHE_TTL) return { data: item.data, isStale: true };
-  return null;
-}
-
-function setCache(key, data) {
-  cache.set(key, { data, ts: Date.now() });
-}
-
-function recordRateLimit(endpoint) {
-  const now = Date.now();
-  if (!rateLimitTracker.has(endpoint)) rateLimitTracker.set(endpoint, []);
-  const times = rateLimitTracker.get(endpoint);
-  times.push(now);
-  rateLimitTracker.set(endpoint, times.filter(t => now - t < 60000));
-}
-
-/* ============================
-   BASIC HEALTH CHECK
-============================ */
+// --------------------------------------------------------
+// 1) 기본 라우트 (health check 용)
+// --------------------------------------------------------
 app.get("/", (req, res) => {
-  res.json({ status: "proxy-ok", timestamp: new Date().toISOString() });
-});
-
-app.get("/healthz", (req, res) => {
   res.json({
-    status: "ok",
-    mode: "REST + WebSocket Relay",
-    timestamp: new Date().toISOString()
+    ok: true,
+    service: "kimpai-price-proxy",
+    message: "Price Proxy Running",
   });
 });
 
-/* ============================
-     REST API PROXY (기존 유지)
-============================ */
+// --------------------------------------------------------
+// 2) 가격 프록시 (기존 기능 유지 가능)
+// ※ 필요한 경우 여기로 원하는 API 우회 추가 가능
+// --------------------------------------------------------
+app.get("/proxy", async (req, res) => {
+  const url = req.query.url;
 
-async function proxyRequest(url, cacheKey, ttl, req, res) {
-  try {
-    let cached = getCached(cacheKey, ttl, true);
-    let data = cached?.data;
-
-    if (!data) {
-      const response = await axios.get(url, {
-        timeout: 10000,
-        headers: { "User-Agent": "Mozilla/5.0" }
-      });
-      data = response.data;
-      setCache(cacheKey, data);
-    }
-
-    return res.json(data);
-  } catch (error) {
-    console.error("Proxy error:", error.message);
-    return res.status(500).json({ error: "Proxy failed" });
+  if (!url) {
+    return res.status(400).json({ ok: false, error: "url query required" });
   }
-}
 
-/* Binance Spot Price */
-app.get("/binance/api/v3/ticker/price", (req, res) =>
-  proxyRequest(
-    "https://api.binance.com/api/v3/ticker/price",
-    "binance_spot_price",
-    PRICE_CACHE_TTL,
-    req,
-    res
-  )
-);
-
-/* Binance Futures Price */
-app.get("/binance/fapi/v1/ticker/price", (req, res) =>
-  proxyRequest(
-    "https://fapi.binance.com/fapi/v1/ticker/price",
-    "binance_futures_price",
-    PRICE_CACHE_TTL,
-    req,
-    res
-  )
-);
-
-/* Binance Spot 24hr */
-app.get("/binance/api/v3/ticker/24hr", (req, res) =>
-  proxyRequest(
-    "https://api.binance.com/api/v3/ticker/24hr",
-    "binance_spot_24hr",
-    STATS_CACHE_TTL,
-    req,
-    res
-  )
-);
-
-/* Binance Futures 24hr */
-app.get("/binance/fapi/v1/ticker/24hr", (req, res) =>
-  proxyRequest(
-    "https://fapi.binance.com/fapi/v1/ticker/24hr",
-    "binance_futures_24hr",
-    STATS_CACHE_TTL,
-    req,
-    res
-  )
-);
-
-/* Bybit REST */
-app.get("/bybit/v5/market/tickers", (req, res) => {
-  const category = req.query.category || "spot";
-  proxyRequest(
-    `https://api.bybit.com/v5/market/tickers?category=${category}`,
-    `bybit_${category}`,
-    PRICE_CACHE_TTL,
-    req,
-    res
-  );
+  try {
+    const response = await axios.get(url, { timeout: 5000 });
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
 });
 
-/* ============================
-   WEBSOCKET RELAY (우회 적용)
-============================ */
+// --------------------------------------------------------
+// 3) ⭐ Binance TOP100 심볼 제공 API (Railway / Replit 공용)
+// --------------------------------------------------------
+app.get("/api/internal/top-symbols", async (req, res) => {
+  try {
+    const symbols = await fetchTop100Symbols();
 
-function createRelay(path, targetUrl) {
-  const wss = new WebSocket.Server({ noServer: true });
-
-  server.on("upgrade", (req, socket, head) => {
-    if (req.url === path) {
-      wss.handleUpgrade(req, socket, head, (client) => {
-        const exchange = new WebSocket(targetUrl);
-
-        exchange.on("open", () => {
-          console.log(`[WS-RELAY] CONNECTED → ${targetUrl}`);
-        });
-
-        exchange.on("message", (msg) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(msg);
-          }
-        });
-
-        exchange.on("close", () => client.close());
-        exchange.on("error", () => client.close());
-        client.on("close", () => exchange.close());
+    if (!symbols || symbols.length === 0) {
+      return res.status(500).json({
+        ok: false,
+        error: "Failed to fetch symbols",
       });
     }
-  });
-}
 
-/* Binance Spot */
-createRelay("/ws/binance/spot", "wss://stream.binance.com:9443/ws/!ticker@arr");
+    return res.json({
+      ok: true,
+      count: symbols.length,
+      symbols,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
 
-/* Binance Futures */
-createRelay("/ws/binance/futures", "wss://fstream.binance.com/ws/!ticker@arr");
-
-/* Bybit (spot + futures 혼합) */
-createRelay("/ws/bybit", "wss://stream.bybit.com/v5/public/spot");
-
-createRelay("/ws/mexc", "wss://wbs.mexc.com/ws");
-createRelay("/ws/gate", "wss://api.gateio.ws/ws/v4/");
-
-/* ============================
-      START SERVER
-============================ */
-
+// --------------------------------------------------------
+// 서버 시작
+// --------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("==============================================");
-  console.log(`KimpAI PROXY + WS RELAY running on port ${PORT}`);
-  console.log("==============================================");
+app.listen(PORT, () => {
+  console.log(`⚡ kimpai-price-proxy running on port ${PORT}`);
 });
