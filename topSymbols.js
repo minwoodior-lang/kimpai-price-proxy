@@ -1,3 +1,4 @@
+// topSymbols.js
 const axios = require("axios");
 
 // Binance 24h ticker 기반 TOP100
@@ -10,7 +11,6 @@ async function fetchTop100Symbols() {
 
     const rows = res.data;
 
-    // USDT 마켓만 필터
     const usdtRows = rows.filter(
       (r) =>
         r.symbol &&
@@ -19,7 +19,6 @@ async function fetchTop100Symbols() {
         !r.symbol.includes("DOWN")
     );
 
-    // 거래대금 정렬 → 상위 100
     const sorted = usdtRows
       .map((r) => ({
         symbol: r.symbol.toLowerCase(),
