@@ -10,14 +10,14 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 
-// TOP100 심볼 생성 모듈
+// TOP100 심볼 모듈
 const { fetchTop100Symbols } = require("./topSymbols");
 
 const app = express();
 app.use(cors());
 
 // --------------------------------------------------------
-// 1) 기본 라우트 (health check 용)
+// 1) 기본 라우트 (health check)
 // --------------------------------------------------------
 app.get("/", (req, res) => {
   res.json({
@@ -28,8 +28,8 @@ app.get("/", (req, res) => {
 });
 
 // --------------------------------------------------------
-// 2) 가격 프록시 (기존 기능 유지 가능)
-// ※ 필요한 경우 여기로 원하는 API 우회 추가 가능
+// 2) 단순 프록시 (원래 쓰던 거 유지용)
+//    /proxy?url=https://.... 형태로 사용
 // --------------------------------------------------------
 app.get("/proxy", async (req, res) => {
   const url = req.query.url;
@@ -50,7 +50,8 @@ app.get("/proxy", async (req, res) => {
 });
 
 // --------------------------------------------------------
-// 3) ⭐ Binance TOP100 심볼 제공 API (Railway / Replit 공용)
+// 3) ⭐ Binance TOP100 심볼 API
+//    Railway / Replit 에서 여기만 때리면 됨
 // --------------------------------------------------------
 app.get("/api/internal/top-symbols", async (req, res) => {
   try {
