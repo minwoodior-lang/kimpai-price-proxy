@@ -1,86 +1,128 @@
 // index.js
-// ------------------------------
-// KimpAI Price Proxy Server
-// Render 전용 서비스
-// 1) 가격 프록시(API 우회)
-// 2) Binance TOP100 심볼 제공 API
-// ------------------------------
+// kimpai-price-proxy v1.1
+// - /api/internal/top-symbols : Binance 24h ticker 기반 TOP 100 USDT 심볼
+// - /binance/*                : https://api.binance.com/* 프록시
+// - /bybit/*                  : https://api.bybit.com/* 프록시
 
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-
-// TOP100 심볼 모듈
-const { fetchTop100Symbols } = require("./topSymbols");
+const {
+  fetchTop100Symbols,
+  getTopSymbolsSync,
+} = require("./topSymbols");
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
 
-// --------------------------------------------------------
-// 1) 기본 라우트 (health check)
-// --------------------------------------------------------
+app.use(cors());
+app.use(express.json());
+
+// 헬스체크
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "kimpai-price-proxy",
-    message: "Price Proxy Running",
+    uptime: process.uptime(),
+    now: new Date().toISOString(),
   });
 });
 
-// --------------------------------------------------------
-// 2) 단순 프록시 (원래 쓰던 거 유지용)
-//    /proxy?url=https://.... 형태로 사용
-// --------------------------------------------------------
-app.get("/proxy", async (req, res) => {
-  const url = req.query.url;
-
-  if (!url) {
-    return res.status(400).json({ ok: false, error: "url query required" });
-  }
-
-  try {
-    const response = await axios.get(url, { timeout: 5000 });
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
-// --------------------------------------------------------
-// 3) ⭐ Binance TOP100 심볼 API
-//    Railway / Replit 에서 여기만 때리면 됨
-// --------------------------------------------------------
+// 내부용 TOP 심볼 API
 app.get("/api/internal/top-symbols", async (req, res) => {
   try {
-    const symbols = await fetchTop100Symbols();
+    const force = req.query.force === "1";
 
-    if (!symbols || symbols.length === 0) {
-      return res.status(500).json({
-        ok: false,
-        error: "Failed to fetch symbols",
-      });
+    let symbols;
+    if (force) {
+      symbols = await fetchTop100Symbols();
+    } else {
+      // 캐시가 있으면 캐시, 없으면 fetch
+      const cached = getTopSymbolsSync();
+      if (cached && cached.length > 0) {
+        symbols = cached;
+      } else {
+        symbols = await fetchTop100Symbols();
+      }
     }
 
-    return res.json({
+    res.json({
       ok: true,
       count: symbols.length,
       symbols,
     });
   } catch (err) {
-    return res.status(500).json({
+    console.error("[Proxy] /api/internal/top-symbols error:", err.message);
+    res.status(500).json({
       ok: false,
-      error: err.message,
+      error: err.message || "internal error",
     });
   }
 });
 
-// --------------------------------------------------------
-// 서버 시작
-// --------------------------------------------------------
-const PORT = process.env.PORT || 3000;
+// 공통 프록시 헬퍼
+async function proxyRequest(baseUrl, req, res) {
+  try {
+    const targetPath = req.originalUrl.replace(/^\/(binance|bybit)/, "");
+    const url = baseUrl + targetPath;
+
+    const config = {
+      method: req.method,
+      url,
+      params: req.query,
+      data: req.body,
+      timeout: 8000,
+      headers: {
+        "User-Agent": "kimpai-price-proxy/1.0",
+      },
+    };
+
+    const resp = await axios(config);
+
+    // content-type 그대로 전달
+    if (resp.headers["content-type"]) {
+      res.setHeader("content-type", resp.headers["content-type"]);
+    }
+    res.status(resp.status).send(resp.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    console.error(
+      `[Proxy] ${baseUrl} error:`,
+      status,
+      err.response?.data || err.message
+    );
+    res.status(status).json({
+      ok: false,
+      proxy: baseUrl.includes("binance")
+        ? "binance"
+        : baseUrl.includes("bybit")
+        ? "bybit"
+        : "unknown",
+      status,
+      message: err.response?.data || err.message,
+    });
+  }
+}
+
+// Binance REST 프록시 (/binance/ 이하 전부)
+app.use("/binance", (req, res) => {
+  proxyRequest("https://api.binance.com", req, res);
+});
+
+// Bybit REST 프록시 (/bybit/ 이하 전부)
+app.use("/bybit", (req, res) => {
+  proxyRequest("https://api.bybit.com", req, res);
+});
+
+// 404 핸들러
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Not Found",
+    path: req.originalUrl,
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`⚡ kimpai-price-proxy running on port ${PORT}`);
+  console.log(`kimpai-price-proxy running on port ${PORT}`);
 });
