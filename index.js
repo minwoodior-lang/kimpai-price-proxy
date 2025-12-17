@@ -21,7 +21,12 @@ function proxyHttp(req, res) {
       upstreamBase = "https://api.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/binance/fapi/")) {
-      // 선물
+      // 선물 (기존 유지)
+      upstreamBase = "https://fapi.binance.com";
+      path = originalUrl.replace(/^\/binance/, "");
+    } else if (originalUrl.startsWith("/binance/futures/data/")) {
+      // ✅ 추가: Binance Futures Data (롱/숏 ratio 등) - 기존 로직 영향 없음
+      // 예: /binance/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=1
       upstreamBase = "https://fapi.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/bybit/")) {
