@@ -1,5 +1,5 @@
 // index.js - kimpai-price-proxy-1
-// HTTP (Binance/Bybit) + WebSocket 프록시 통합 버전
+// HTTP (Binance/Bybit) + WebSocket 프록시 통합 버전 (hardened)
 
 const http = require("http");
 const https = require("https");
@@ -17,31 +17,30 @@ function proxyHttp(req, res) {
     let path = originalUrl;
 
     if (originalUrl.startsWith("/binance/api/")) {
-      // 현물
+      // Binance Spot REST
       upstreamBase = "https://api.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/binance/fapi/")) {
-      // 선물 (기존 유지)
+      // Binance Futures REST (/fapi/v1, /fapi/v2 ...)
       upstreamBase = "https://fapi.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/binance/futures/data/")) {
-      // ✅ 추가: Binance Futures Data (롱/숏 ratio 등) - 기존 로직 영향 없음
-      // 예: /binance/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=1
+      // ✅ Binance Futures Data (롱/숏 ratio, OI hist 등)
       upstreamBase = "https://fapi.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/bybit/")) {
+      // Bybit REST
       upstreamBase = "https://api.bybit.com";
       path = originalUrl.replace(/^\/bybit/, "");
     }
 
+    // health / default
     if (!upstreamBase) {
-      // 우리가 프록시 안 하는 경로는 그냥 “WS only” 문구만
       if (originalUrl === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, mode: "http+ws-proxy" }));
         return;
       }
-
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("kimpai-price-proxy-1 (HTTP+WS proxy)");
       return;
@@ -49,33 +48,74 @@ function proxyHttp(req, res) {
 
     const target = new URL(path, upstreamBase);
 
+    // --- Build safe headers ---
+    // 1) hop-by-hop 헤더 제거
+    // 2) host는 우리가 세팅하지 않음 (https.request가 target 기준으로 정리)
+    const incomingHeaders = { ...req.headers };
+    delete incomingHeaders.host;
+    delete incomingHeaders.connection;
+    delete incomingHeaders["proxy-connection"];
+    delete incomingHeaders["keep-alive"];
+    delete incomingHeaders["transfer-encoding"];
+    delete incomingHeaders.te;
+    delete incomingHeaders.trailer;
+    delete incomingHeaders.upgrade;
+
+    // 3) UA 없으면 넣기 (일부 WAF/엣지에서 필요)
+    if (!incomingHeaders["user-agent"]) {
+      incomingHeaders["user-agent"] = "Mozilla/5.0 (kimpai-price-proxy)";
+    }
+
     const options = {
       method: req.method,
-      headers: {
-        ...req.headers,
-        host: target.host, // Host 헤더 정리
-      },
+      headers: incomingHeaders,
     };
 
-    console.log(`[HTTP-Proxy] ${originalUrl} → ${target.href}`);
+    const startedAt = Date.now();
+    console.log(`[HTTP-Proxy] ${req.method} ${originalUrl} → ${target.href}`);
 
     const upstreamReq = https.request(target, options, (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode || 500, upstreamRes.headers);
+      const ms = Date.now() - startedAt;
+      const status = upstreamRes.statusCode || 500;
+
+      // --- Response headers sanitize ---
+      // CloudFront/Edge에서 문제 만드는 헤더들을 최소화
+      const outHeaders = { ...upstreamRes.headers };
+
+      // hop-by-hop 제거
+      delete outHeaders.connection;
+      delete outHeaders["proxy-connection"];
+      delete outHeaders["keep-alive"];
+      delete outHeaders["transfer-encoding"];
+      delete outHeaders.te;
+      delete outHeaders.trailer;
+      delete outHeaders.upgrade;
+
+      // 경우에 따라 압축/길이 꼬이면 엣지가 403 내는 경우가 있어 안전 처리
+      // (binance는 보통 gzip 쓰는데, 그대로 전달해도 되지만 문제 시 여기서 정리)
+      // 필요하면 주석 해제:
+      // delete outHeaders["content-encoding"];
+
+      console.log(
+        `[HTTP-Proxy] ← ${status} ${req.method} ${originalUrl} (${ms}ms)`
+      );
+
+      res.writeHead(status, outHeaders);
       upstreamRes.pipe(res);
     });
 
     upstreamReq.on("error", (err) => {
-      console.error("[HTTP-Proxy] Upstream error:", err.message || err);
+      console.error("[HTTP-Proxy] Upstream error:", err && (err.stack || err.message || err));
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
       }
       res.end(JSON.stringify({ ok: false, error: "upstream_error" }));
     });
 
-    // 요청 바디가 있으면 전달 (GET이면 거의 없음)
+    // request body forward
     req.pipe(upstreamReq);
   } catch (err) {
-    console.error("[HTTP-Proxy] Handler error:", err.message || err);
+    console.error("[HTTP-Proxy] Handler error:", err && (err.stack || err.message || err));
     if (!res.headersSent) {
       res.writeHead(500, { "Content-Type": "application/json" });
     }
@@ -129,59 +169,41 @@ server.on("upgrade", (req, socket, head) => {
 
     upstream.on("open", () => {
       wss.handleUpgrade(req, socket, head, (client) => {
-        // client → upstream
         client.on("message", (data) => {
-          if (upstream.readyState === WebSocket.OPEN) {
-            upstream.send(data);
-          }
+          if (upstream.readyState === WebSocket.OPEN) upstream.send(data);
         });
 
-        // upstream → client
         upstream.on("message", (data) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(data);
-          }
+          if (client.readyState === WebSocket.OPEN) client.send(data);
         });
 
         client.on("close", () => {
-          try {
-            upstream.close();
-          } catch (_) {}
+          try { upstream.close(); } catch (_) {}
         });
 
         upstream.on("close", () => {
-          try {
-            client.close();
-          } catch (_) {}
+          try { client.close(); } catch (_) {}
         });
 
         client.on("error", (err) => {
-          console.error("[WS-Proxy] Client error:", err.message || err);
-          try {
-            upstream.close();
-          } catch (_) {}
+          console.error("[WS-Proxy] Client error:", err && (err.message || err));
+          try { upstream.close(); } catch (_) {}
         });
 
         upstream.on("error", (err) => {
-          console.error("[WS-Proxy] Upstream error:", err.message || err);
-          try {
-            client.close();
-          } catch (_) {}
+          console.error("[WS-Proxy] Upstream error:", err && (err.message || err));
+          try { client.close(); } catch (_) {}
         });
       });
     });
 
     upstream.on("error", (err) => {
-      console.error("[WS-Proxy] Cannot connect upstream:", err.message || err);
-      try {
-        socket.destroy();
-      } catch (_) {}
+      console.error("[WS-Proxy] Cannot connect upstream:", err && (err.message || err));
+      try { socket.destroy(); } catch (_) {}
     });
   } catch (err) {
-    console.error("[WS-Proxy] upgrade handler error:", err.message || err);
-    try {
-      socket.destroy();
-    } catch (_) {}
+    console.error("[WS-Proxy] upgrade handler error:", err && (err.stack || err.message || err));
+    try { socket.destroy(); } catch (_) {}
   }
 });
 
