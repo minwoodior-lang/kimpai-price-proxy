@@ -1,5 +1,5 @@
 // index.js - kimpai-price-proxy-1
-// HTTP (Binance/Bybit) + WebSocket 프록시 통합 버전 (hardened)
+// HTTP (Binance/Bybit) + WebSocket 프록시 통합 버전 (hardened + debug)
 
 const http = require("http");
 const https = require("https");
@@ -11,7 +11,25 @@ const { URL } = require("url");
 // ---------------------------------------------------
 function proxyHttp(req, res) {
   try {
-    const originalUrl = req.url; // 예: /binance/api/v3/ticker/price?symbol=BTCUSDT
+    const originalUrl = req.url;
+
+    // --- Debug: egress IP 확인 (Shell 없어도 확인 가능) ---
+    if (originalUrl === "/debug/ip") {
+      https
+        .get("https://api.ipify.org?format=json", (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(data);
+          });
+        })
+        .on("error", (e) => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "ip_lookup_failed" }));
+        });
+      return;
+    }
 
     let upstreamBase = null;
     let path = originalUrl;
@@ -21,7 +39,7 @@ function proxyHttp(req, res) {
       upstreamBase = "https://api.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/binance/fapi/")) {
-      // Binance Futures REST (/fapi/v1, /fapi/v2 ...)
+      // Binance Futures REST
       upstreamBase = "https://fapi.binance.com";
       path = originalUrl.replace(/^\/binance/, "");
     } else if (originalUrl.startsWith("/binance/futures/data/")) {
@@ -48,10 +66,10 @@ function proxyHttp(req, res) {
 
     const target = new URL(path, upstreamBase);
 
-    // --- Build safe headers ---
-    // 1) hop-by-hop 헤더 제거
-    // 2) host는 우리가 세팅하지 않음 (https.request가 target 기준으로 정리)
+    // --- Build safe request headers ---
     const incomingHeaders = { ...req.headers };
+
+    // hop-by-hop 제거
     delete incomingHeaders.host;
     delete incomingHeaders.connection;
     delete incomingHeaders["proxy-connection"];
@@ -61,9 +79,23 @@ function proxyHttp(req, res) {
     delete incomingHeaders.trailer;
     delete incomingHeaders.upgrade;
 
-    // 3) UA 없으면 넣기 (일부 WAF/엣지에서 필요)
+    // UA 없으면 추가
     if (!incomingHeaders["user-agent"]) {
       incomingHeaders["user-agent"] = "Mozilla/5.0 (kimpai-price-proxy)";
+    }
+
+    // ✅ Futures 계열은 WAF/차단 회피용 브라우저 헤더 강제
+    const isBinanceFutures =
+      originalUrl.startsWith("/binance/fapi/") ||
+      originalUrl.startsWith("/binance/futures/data/");
+    if (isBinanceFutures) {
+      incomingHeaders["accept"] = incomingHeaders["accept"] || "*/*";
+      incomingHeaders["accept-language"] =
+        incomingHeaders["accept-language"] || "en-US,en;q=0.9";
+      incomingHeaders["cache-control"] = "no-cache";
+      incomingHeaders["pragma"] = "no-cache";
+      incomingHeaders["referer"] = "https://www.binance.com/";
+      incomingHeaders["origin"] = "https://www.binance.com";
     }
 
     const options = {
@@ -78,8 +110,22 @@ function proxyHttp(req, res) {
       const ms = Date.now() - startedAt;
       const status = upstreamRes.statusCode || 500;
 
+      // ✅ 4xx/5xx면 upstream body 일부를 로그에 찍어서 원인 확정
+      if (status >= 400) {
+        let buf = "";
+        upstreamRes.on("data", (chunk) => {
+          if (buf.length < 2000) buf += chunk.toString("utf8");
+        });
+        upstreamRes.on("end", () => {
+          console.log(
+            `[HTTP-Proxy][UPSTREAM_BODY] ${status} ${originalUrl} :: ${buf
+              .slice(0, 500)
+              .replace(/\s+/g, " ")}`
+          );
+        });
+      }
+
       // --- Response headers sanitize ---
-      // CloudFront/Edge에서 문제 만드는 헤더들을 최소화
       const outHeaders = { ...upstreamRes.headers };
 
       // hop-by-hop 제거
@@ -91,9 +137,7 @@ function proxyHttp(req, res) {
       delete outHeaders.trailer;
       delete outHeaders.upgrade;
 
-      // 경우에 따라 압축/길이 꼬이면 엣지가 403 내는 경우가 있어 안전 처리
-      // (binance는 보통 gzip 쓰는데, 그대로 전달해도 되지만 문제 시 여기서 정리)
-      // 필요하면 주석 해제:
+      // 필요 시 압축 제거(문제 계속되면 주석 해제)
       // delete outHeaders["content-encoding"];
 
       console.log(
@@ -105,17 +149,22 @@ function proxyHttp(req, res) {
     });
 
     upstreamReq.on("error", (err) => {
-      console.error("[HTTP-Proxy] Upstream error:", err && (err.stack || err.message || err));
+      console.error(
+        "[HTTP-Proxy] Upstream error:",
+        err && (err.stack || err.message || err)
+      );
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
       }
       res.end(JSON.stringify({ ok: false, error: "upstream_error" }));
     });
 
-    // request body forward
     req.pipe(upstreamReq);
   } catch (err) {
-    console.error("[HTTP-Proxy] Handler error:", err && (err.stack || err.message || err));
+    console.error(
+      "[HTTP-Proxy] Handler error:",
+      err && (err.stack || err.message || err)
+    );
     if (!res.headersSent) {
       res.writeHead(500, { "Content-Type": "application/json" });
     }
@@ -140,16 +189,11 @@ server.on("upgrade", (req, socket, head) => {
 
     let target;
 
-    // Binance Spot - /binance/spot?streams=...
     if (pathname === "/binance/spot") {
       target = `wss://stream.binance.com:9443/stream${search}`;
-    }
-    // Binance Futures - /binance/futures?streams=...
-    else if (pathname === "/binance/futures") {
+    } else if (pathname === "/binance/futures") {
       target = `wss://fstream.binance.com/stream${search}`;
-    }
-    // Bybit Spot - /bybit/spot?stream=...
-    else if (pathname === "/bybit/spot") {
+    } else if (pathname === "/bybit/spot") {
       target = `wss://stream.bybit.com/v5/public/spot${search}`;
     } else {
       console.warn("[WS-Proxy] Unknown path:", pathname);
@@ -178,36 +222,59 @@ server.on("upgrade", (req, socket, head) => {
         });
 
         client.on("close", () => {
-          try { upstream.close(); } catch (_) {}
+          try {
+            upstream.close();
+          } catch (_) {}
         });
 
         upstream.on("close", () => {
-          try { client.close(); } catch (_) {}
+          try {
+            client.close();
+          } catch (_) {}
         });
 
         client.on("error", (err) => {
           console.error("[WS-Proxy] Client error:", err && (err.message || err));
-          try { upstream.close(); } catch (_) {}
+          try {
+            upstream.close();
+          } catch (_) {}
         });
 
         upstream.on("error", (err) => {
-          console.error("[WS-Proxy] Upstream error:", err && (err.message || err));
-          try { client.close(); } catch (_) {}
+          console.error(
+            "[WS-Proxy] Upstream error:",
+            err && (err.message || err)
+          );
+          try {
+            client.close();
+          } catch (_) {}
         });
       });
     });
 
     upstream.on("error", (err) => {
-      console.error("[WS-Proxy] Cannot connect upstream:", err && (err.message || err));
-      try { socket.destroy(); } catch (_) {}
+      console.error(
+        "[WS-Proxy] Cannot connect upstream:",
+        err && (err.message || err)
+      );
+      try {
+        socket.destroy();
+      } catch (_) {}
     });
   } catch (err) {
-    console.error("[WS-Proxy] upgrade handler error:", err && (err.stack || err.message || err));
-    try { socket.destroy(); } catch (_) {}
+    console.error(
+      "[WS-Proxy] upgrade handler error:",
+      err && (err.stack || err.message || err)
+    );
+    try {
+      socket.destroy();
+    } catch (_) {}
   }
 });
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`kimpai-price-proxy-1 listening on ${PORT} (HTTP + WS proxy mode)`);
+  console.log(
+    `kimpai-price-proxy-1 listening on ${PORT} (HTTP + WS proxy mode)`
+  );
 });
